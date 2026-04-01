@@ -20,6 +20,7 @@ import (
 	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go/middleware"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/certmagic"
@@ -121,6 +122,9 @@ func (s3 *S3) buildS3Client() (*s3sdk.Client, error) {
 		s3Options = append(s3Options, func(o *s3sdk.Options) {
 			o.BaseEndpoint = aws.String(s3.Endpoint)
 		})
+		s3Options = append(s3Options, func(o *s3sdk.Options) {
+			o.APIOptions = append(o.APIOptions, stripAcceptEncodingIdentity)
+		})
 	}
 
 	if s3.UsePathStyle {
@@ -130,6 +134,11 @@ func (s3 *S3) buildS3Client() (*s3sdk.Client, error) {
 	}
 
 	return s3sdk.NewFromConfig(cfg, s3Options...), nil
+}
+
+func stripAcceptEncodingIdentity(stack *middleware.Stack) error {
+	_, _ = stack.Finalize.Remove("DisableAcceptEncodingGzip")
+	return nil
 }
 
 func (s3 *S3) setupEncryption() error {
@@ -438,7 +447,7 @@ func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		var value string
 
 		if !d.Args(&value) {
-			continue;
+			continue
 		}
 
 		switch key {
