@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
@@ -50,6 +52,9 @@ type S3 struct {
 	EncryptionKey string `json:"encryption_key"`
 
 	iowrap IO
+
+	// locks tracks the refresh goroutine for each held lock, keyed by lock key.
+	locks *sync.Map
 }
 
 func init() {
@@ -58,6 +63,7 @@ func init() {
 
 func (s3 *S3) Provision(ctx caddy.Context) error {
 	s3.Logger = ctx.Logger(s3)
+	s3.locks = &sync.Map{}
 
 	if s3.Host != "" {
 		s3.Logger.Info("Using deprecated 'host' option, consider switching to 'endpoint'",
@@ -168,55 +174,58 @@ func (s3 *S3) CaddyModule() caddy.ModuleInfo {
 }
 
 var (
-	LockExpiration   = 2 * time.Minute
+	// LockExpiration is how long a held lock may go without a refresh before
+	// another instance is allowed to steal it (e.g. after a crash). It must be
+	// safely larger than LockRefreshInterval.
+	LockExpiration = 2 * time.Minute
+	// LockPollInterval is how long to wait between attempts to acquire a lock
+	// that is currently held by someone else.
 	LockPollInterval = 1 * time.Second
-	LockTimeout      = 15 * time.Second
+	// LockRefreshInterval is how often a held lock's timestamp is rewritten so
+	// it does not appear stale while issuance (which certmagic serializes under
+	// this lock across its full retry sequence) is still in progress.
+	LockRefreshInterval = 30 * time.Second
 )
 
+// Lock acquires a distributed lock for key, blocking until it is obtained or
+// ctx is cancelled. Acquisition is atomic: the lock object is created with a
+// conditional (create-only) PutObject, so concurrent callers across instances
+// can never both believe they hold the lock. Once held, the lock is refreshed
+// in the background until Unlock so long-running issuance is not stolen.
 func (s3 *S3) Lock(ctx context.Context, key string) error {
 	s3.Logger.Info(fmt.Sprintf("Lock: %v", s3.objName(key)))
-	startedAt := time.Now()
 
 	for {
-		input := &s3sdk.GetObjectInput{
-			Bucket: aws.String(s3.Bucket),
-			Key:    aws.String(s3.objLockName(key)),
+		err := s3.putLockFile(ctx, key, true)
+		if err == nil {
+			s3.startLockRefresh(key)
+			return nil
 		}
-
-		result, err := s3.Client.GetObject(ctx, input)
-		if err != nil {
-			var nsk *types.NoSuchKey
-			if errors.As(err, &nsk) {
-				return s3.putLockFile(ctx, key)
+		if !isPreconditionFailed(err) {
+			// Transient error (network, etc.): back off and retry.
+			if waitErr := sleepOrDone(ctx, LockPollInterval); waitErr != nil {
+				return waitErr
 			}
 			continue
 		}
 
-		buf, err := io.ReadAll(result.Body)
-		_ = result.Body.Close()
-		if err != nil {
+		// Lock already exists. Steal it only if it has gone stale; the steal is
+		// race-safe because the subsequent create is itself atomic.
+		if s3.lockIsStale(ctx, key) {
+			_ = s3.deleteLockFile(ctx, key)
 			continue
 		}
 
-		lt, err := time.Parse(time.RFC3339, string(buf))
-		if err != nil {
-			// Lock file does not make sense, overwrite.
-			return s3.putLockFile(ctx, key)
+		if waitErr := sleepOrDone(ctx, LockPollInterval); waitErr != nil {
+			return waitErr
 		}
-		if lt.Add(LockTimeout).Before(time.Now()) {
-			// Existing lock file expired, overwrite.
-			return s3.putLockFile(ctx, key)
-		}
-
-		if startedAt.Add(LockTimeout).Before(time.Now()) {
-			return errors.New("acquiring lock failed")
-		}
-		time.Sleep(LockPollInterval)
 	}
 }
 
-func (s3 *S3) putLockFile(ctx context.Context, key string) error {
-	// Object does not exist, we're creating a lock file.
+// putLockFile writes the lock object with the current timestamp. When createOnly
+// is true it uses a conditional write (If-None-Match: *) so the PutObject only
+// succeeds if no lock object exists, giving atomic acquisition.
+func (s3 *S3) putLockFile(ctx context.Context, key string, createOnly bool) error {
 	lockData := []byte(time.Now().Format(time.RFC3339))
 	r := bytes.NewReader(lockData)
 
@@ -226,21 +235,123 @@ func (s3 *S3) putLockFile(ctx context.Context, key string) error {
 		Body:          r,
 		ContentLength: aws.Int64(int64(len(lockData))),
 	}
+	if createOnly {
+		input.IfNoneMatch = aws.String("*")
+	}
 
 	_, err := s3.Client.PutObject(ctx, input)
 	return err
 }
 
-func (s3 *S3) Unlock(ctx context.Context, key string) error {
-	s3.Logger.Info(fmt.Sprintf("Release lock: %v", s3.objName(key)))
-
-	input := &s3sdk.DeleteObjectInput{
+// lockIsStale reports whether the existing lock object is older than
+// LockExpiration (or missing/unparseable), meaning it may be stolen.
+func (s3 *S3) lockIsStale(ctx context.Context, key string) bool {
+	input := &s3sdk.GetObjectInput{
 		Bucket: aws.String(s3.Bucket),
 		Key:    aws.String(s3.objLockName(key)),
 	}
 
+	result, err := s3.Client.GetObject(ctx, input)
+	if err != nil {
+		var nsk *types.NoSuchKey
+		// Lock vanished between attempts: treat as acquirable.
+		return errors.As(err, &nsk)
+	}
+	defer func() { _ = result.Body.Close() }()
+
+	buf, err := io.ReadAll(result.Body)
+	if err != nil {
+		return false
+	}
+
+	lt, err := time.Parse(time.RFC3339, string(buf))
+	if err != nil {
+		// Lock file does not make sense, allow overwrite.
+		return true
+	}
+	return time.Now().After(lt.Add(LockExpiration))
+}
+
+func (s3 *S3) deleteLockFile(ctx context.Context, key string) error {
+	input := &s3sdk.DeleteObjectInput{
+		Bucket: aws.String(s3.Bucket),
+		Key:    aws.String(s3.objLockName(key)),
+	}
 	_, err := s3.Client.DeleteObject(ctx, input)
 	return err
+}
+
+// startLockRefresh keeps a held lock fresh by periodically rewriting its
+// timestamp until the lock is released via Unlock.
+func (s3 *S3) startLockRefresh(key string) {
+	refreshCtx, cancel := context.WithCancel(context.Background())
+	if prev, loaded := s3.locks.Swap(key, cancel); loaded {
+		// Defensive: cancel any orphaned refresher for the same key.
+		prev.(context.CancelFunc)()
+	}
+
+	go func() {
+		ticker := time.NewTicker(LockRefreshInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-refreshCtx.Done():
+				return
+			case <-ticker.C:
+				if err := s3.putLockFile(refreshCtx, key, false); err != nil && refreshCtx.Err() == nil {
+					s3.Logger.Warn("failed to refresh lock",
+						zap.String("key", s3.objLockName(key)),
+						zap.Error(err),
+					)
+				}
+			}
+		}
+	}()
+}
+
+func (s3 *S3) Unlock(ctx context.Context, key string) error {
+	s3.Logger.Info(fmt.Sprintf("Release lock: %v", s3.objName(key)))
+
+	if cancel, ok := s3.locks.LoadAndDelete(key); ok {
+		cancel.(context.CancelFunc)()
+	}
+
+	if err := s3.deleteLockFile(ctx, key); err != nil {
+		var nsk *types.NoSuchKey
+		if errors.As(err, &nsk) || isNotFound(err) {
+			// Already released: not an error.
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func sleepOrDone(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func isPreconditionFailed(err error) bool {
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) {
+		return respErr.HTTPStatusCode() == http.StatusPreconditionFailed
+	}
+	return false
+}
+
+func isNotFound(err error) bool {
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) {
+		return respErr.HTTPStatusCode() == http.StatusNotFound
+	}
+	return false
 }
 
 func (s3 *S3) Store(ctx context.Context, key string, value []byte) error {
