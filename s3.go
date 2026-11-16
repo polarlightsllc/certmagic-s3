@@ -27,6 +27,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 var ErrInvalidKey = errors.New("invalid key")
@@ -481,12 +482,41 @@ func (s3 *S3) Exists(ctx context.Context, key string) bool {
 	return exists
 }
 
+// List returns the keys under prefix, relative to the configured storage
+// prefix so they can be passed straight back to Load/Stat/Delete. When
+// recursive is false only the immediate children are returned, with
+// "directories" reported without a trailing slash, mirroring certmagic's
+// FileStorage.
 func (s3 *S3) List(ctx context.Context, prefix string, recursive bool) ([]string, error) {
-	var keys []string
+	base := s3.objName("")
+	listPrefix := s3.objName(prefix)
+	if listPrefix != "" && !strings.HasSuffix(listPrefix, "/") {
+		listPrefix += "/"
+	}
 
 	input := &s3sdk.ListObjectsV2Input{
 		Bucket: aws.String(s3.Bucket),
-		Prefix: aws.String(s3.objName("")),
+		Prefix: aws.String(listPrefix),
+	}
+	if !recursive {
+		input.Delimiter = aws.String("/")
+	}
+
+	var keys []string
+	seen := make(map[string]struct{})
+	add := func(objKey string) {
+		if objKey == listPrefix || !strings.HasPrefix(objKey, base) {
+			return
+		}
+		key := strings.TrimSuffix(strings.TrimPrefix(objKey, base), "/")
+		if key == "" {
+			return
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
 	}
 
 	paginator := s3sdk.NewListObjectsV2Paginator(s3.Client, input)
@@ -495,9 +525,11 @@ func (s3 *S3) List(ctx context.Context, prefix string, recursive bool) ([]string
 		if err != nil {
 			return nil, err
 		}
-
 		for _, obj := range result.Contents {
-			keys = append(keys, aws.ToString(obj.Key))
+			add(aws.ToString(obj.Key))
+		}
+		for _, cp := range result.CommonPrefixes {
+			add(aws.ToString(cp.Prefix))
 		}
 	}
 
@@ -541,6 +573,19 @@ func (s3 *S3) objName(key string) string {
 
 func (s3 *S3) objLockName(key string) string {
 	return s3.objName(key) + ".lock"
+}
+
+// MarshalLogObject controls how the storage renders when certmagic or Caddy
+// log it (e.g. zap.Any("storage", storage)), so credentials and the
+// encryption key never reach the logs.
+func (s3 *S3) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddString("module", "caddy.storage.s3")
+	enc.AddString("endpoint", s3.Endpoint)
+	enc.AddString("bucket", s3.Bucket)
+	enc.AddString("region", s3.Region)
+	enc.AddString("prefix", s3.Prefix)
+	enc.AddBool("encrypted", s3.EncryptionKey != "")
+	return nil
 }
 
 // CertMagicStorage converts s to a certmagic.Storage instance.
@@ -627,7 +672,8 @@ func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 }
 
 var (
-	_ caddy.Provisioner      = (*S3)(nil)
-	_ caddy.StorageConverter = (*S3)(nil)
-	_ caddyfile.Unmarshaler  = (*S3)(nil)
+	_ caddy.Provisioner       = (*S3)(nil)
+	_ caddy.StorageConverter  = (*S3)(nil)
+	_ caddyfile.Unmarshaler   = (*S3)(nil)
+	_ zapcore.ObjectMarshaler = (*S3)(nil)
 )
